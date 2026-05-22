@@ -289,7 +289,19 @@
         <input v-model="draft.name" class="field" placeholder="App 名称，例如 GitHub" />
         <input v-model="draft.login" class="field" placeholder="登录账号 / 邮箱 / 手机号" />
         <input v-model="draft.password" class="field" password placeholder="密码，例如 App 登录密码" />
-        <input v-model="draft.category" class="field" placeholder="分类，例如 开发 / 社交 / 订阅" />
+        <view class="category-picker">
+          <view
+            v-for="category in categoryOptions"
+            :key="category.value"
+            class="category-chip"
+            :class="{ active: draft.category === category.value }"
+            @tap="selectCategory(category.value)"
+          >
+            <text class="category-chip-title">{{ category.label }}</text>
+            <text class="category-chip-hint">{{ category.hint }}</text>
+          </view>
+        </view>
+        <input v-model="draft.category" class="field" placeholder="自定义分类，例如 开发 / 社交 / 邮箱" />
         <button class="primary-button" @tap="saveAccount">{{ editingId ? '保存修改' : '保存账号' }}</button>
       </view>
     </view>
@@ -373,12 +385,21 @@ const USERS_STORAGE_KEY = "account-manager-users";
 const SESSION_STORAGE_KEY = "account-manager-current-user";
 const CLOUD_TOKEN_STORAGE_KEY = "account-manager-cloud-token";
 const USER_DATA_PREFIX = "account-manager-data:";
+const CATEGORY_PERSONAL = "个人";
+const CATEGORY_SUBSCRIPTION = "订阅";
+const CATEGORY_SERVICE = "服务";
+const CATEGORY_CLOUD_SERVICE = "云服务";
+const NO_RENEWAL = "无";
+const AUTO_SYNC_DELAY = 1200;
 
 const registeredUsers = ref<LocalUser[]>([]);
 const currentUser = ref<LocalUser | null>(null);
 const cloudToken = ref("");
 const isSyncingCloud = ref(false);
 const isHydratingUserData = ref(false);
+const hasLoadedCloudOnLogin = ref(false);
+const lastCloudSyncAt = ref("");
+let autoSyncTimer: ReturnType<typeof setTimeout> | null = null;
 const authMode = ref<"login" | "register">("login");
 const authDraft = reactive({
   username: "",
@@ -419,10 +440,14 @@ const userInitial = computed(() => displayName.value.trim().slice(0, 1).toUpperC
 
 const cloudStatusText = computed(() => {
   if (!cloudToken.value) {
-    return "登录后可使用云端备份和恢复";
+    return "登录后自动同步云端备份";
   }
 
-  return isSyncingCloud.value ? "正在同步云端数据" : "已连接云端，可手动备份或恢复";
+  if (isSyncingCloud.value) {
+    return "正在同步云端数据";
+  }
+
+  return lastCloudSyncAt.value ? `上次同步 ${lastCloudSyncAt.value}` : "已连接云端，修改后会自动同步";
 });
 
 onMounted(() => {
@@ -447,6 +472,12 @@ const filters = [
   { label: "个人", value: "personal" as const },
   { label: "订阅", value: "subscription" as const },
   { label: "服务", value: "service" as const },
+];
+
+const categoryOptions = [
+  { label: "个人", value: CATEGORY_PERSONAL, hint: "普通账号" },
+  { label: "订阅", value: CATEGORY_SUBSCRIPTION, hint: "续费提醒" },
+  { label: "服务", value: CATEGORY_SERVICE, hint: "云服务/域名" },
 ];
 
 const accounts = ref<Account[]>([
@@ -512,7 +543,7 @@ const stats = computed(() => [
 const recentAccounts = computed(() => accounts.value.slice(0, 3));
 const subscriptionReminderCount = computed(() => subscriptionReminders.value.length);
 const categoryCount = computed(() => new Set(accounts.value.map((item) => item.category)).size);
-const subscriptionAccounts = computed(() => accounts.value.filter((item) => item.category === "订阅"));
+const subscriptionAccounts = computed(() => accounts.value.filter((item) => isSubscriptionAccount(item)));
 const selectedSubscriptionAccount = computed(
   () => subscriptionAccounts.value.find((item) => item.id === selectedSubscriptionAccountId.value) || null
 );
@@ -522,9 +553,9 @@ const filteredAccounts = computed(() => {
   return accounts.value.filter((account) => {
     const filterMatched =
       accountFilter.value === "all" ||
-      (accountFilter.value === "subscription" && account.renewal !== "无" && account.category !== "云服务") ||
-      (accountFilter.value === "personal" && account.renewal === "无" && account.category !== "云服务") ||
-      (accountFilter.value === "service" && account.category === "云服务");
+      (accountFilter.value === "subscription" && isSubscriptionAccount(account)) ||
+      (accountFilter.value === "personal" && isPersonalAccount(account)) ||
+      (accountFilter.value === "service" && isServiceAccount(account));
     const text = [account.name, account.login, account.category, ...account.tags]
       .join(" ")
       .toLowerCase();
@@ -551,6 +582,17 @@ watch(
     persistCurrentUserData();
   },
   { deep: true }
+);
+
+watch(
+  cloudToken,
+  (token) => {
+    if (token && currentUser.value && !hasLoadedCloudOnLogin.value) {
+      hasLoadedCloudOnLogin.value = true;
+      void pullCloudData({ silent: true, confirm: false });
+    }
+  },
+  { immediate: true }
 );
 
 watch(
@@ -593,6 +635,7 @@ function persistCurrentUserData() {
   }
 
   uni.setStorageSync(getUserDataStorageKey(currentUser.value.username), getCurrentUserData());
+  scheduleAutoCloudSync();
 }
 
 function loadUserData(username: string) {
@@ -654,16 +697,22 @@ function requestCloud<T>(
 }
 
 function saveCloudLogin(auth: CloudAuthResponse) {
-  cloudToken.value = auth.token;
   const user = { username: auth.user.username, password: "" };
   currentUser.value = user;
   uni.setStorageSync(SESSION_STORAGE_KEY, user);
   uni.setStorageSync(CLOUD_TOKEN_STORAGE_KEY, auth.token);
+  cloudToken.value = auth.token;
   loadUserData(user.username);
 }
 
 function clearCloudLogin() {
   cloudToken.value = "";
+  hasLoadedCloudOnLogin.value = false;
+  lastCloudSyncAt.value = "";
+  if (autoSyncTimer) {
+    clearTimeout(autoSyncTimer);
+    autoSyncTimer = null;
+  }
   uni.removeStorageSync(CLOUD_TOKEN_STORAGE_KEY);
 }
 
@@ -742,6 +791,71 @@ function logout() {
 
 function getErrorMessage(error: unknown) {
   return error instanceof Error ? error.message : "操作失败，请稍后再试";
+}
+
+function isNoRenewal(value: string) {
+  return !value || value === NO_RENEWAL;
+}
+
+function isServiceAccount(account: Account) {
+  return account.category === CATEGORY_SERVICE || account.category === CATEGORY_CLOUD_SERVICE;
+}
+
+function isSubscriptionAccount(account: Account) {
+  return account.category === CATEGORY_SUBSCRIPTION;
+}
+
+function isPersonalAccount(account: Account) {
+  return !isSubscriptionAccount(account) && !isServiceAccount(account);
+}
+
+function normalizeCategory(category: string) {
+  const value = category.trim();
+  if (!value) {
+    return CATEGORY_PERSONAL;
+  }
+
+  if (value === CATEGORY_CLOUD_SERVICE) {
+    return CATEGORY_SERVICE;
+  }
+
+  return value;
+}
+
+function getCategoryColor(category: string, currentColor?: string) {
+  if (category === CATEGORY_SERVICE) {
+    return "#214A87";
+  }
+
+  if (category === CATEGORY_SUBSCRIPTION) {
+    return "#8FCB9B";
+  }
+
+  return currentColor || "#F3C84B";
+}
+
+function selectCategory(category: string) {
+  draft.category = category;
+}
+
+function markCloudSynced() {
+  const now = new Date();
+  lastCloudSyncAt.value = `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+}
+
+function scheduleAutoCloudSync() {
+  if (!cloudToken.value || !currentUser.value || isSyncingCloud.value) {
+    return;
+  }
+
+  if (autoSyncTimer) {
+    clearTimeout(autoSyncTimer);
+  }
+
+  autoSyncTimer = setTimeout(() => {
+    autoSyncTimer = null;
+    void pushCloudData({ silent: true, confirm: false });
+  }, AUTO_SYNC_DELAY);
 }
 
 function resetAuthDraft() {
@@ -942,20 +1056,24 @@ function deleteSubscriptionReminder(id: number) {
   if (reminder) {
     const account = accounts.value.find((item) => item.id === reminder.accountId);
     if (account) {
-      account.renewal = "无";
+      account.renewal = NO_RENEWAL;
     }
   }
   uni.showToast({ title: "已删除订阅", icon: "success" });
 }
 
-function ensureCloudReady() {
+function ensureCloudReady(silent = false) {
   if (!currentUser.value || !cloudToken.value) {
-    uni.showToast({ title: "请先登录云端账号", icon: "none" });
+    if (!silent) {
+      uni.showToast({ title: "请先登录云端账号", icon: "none" });
+    }
     return false;
   }
 
   if (isSyncingCloud.value) {
-    uni.showToast({ title: "正在同步，请稍等", icon: "none" });
+    if (!silent) {
+      uni.showToast({ title: "正在同步，请稍等", icon: "none" });
+    }
     return false;
   }
 
@@ -975,14 +1093,16 @@ function confirmAction(title: string, content: string, confirmText = "确定") {
   });
 }
 
-async function pushCloudData() {
-  if (!ensureCloudReady()) {
+async function pushCloudData(options: { silent?: boolean; confirm?: boolean } = {}) {
+  if (!ensureCloudReady(Boolean(options.silent))) {
     return;
   }
 
-  const confirmed = await confirmAction("上传到云端", "会用当前本机数据覆盖云端备份，确定继续吗？", "上传");
-  if (!confirmed) {
-    return;
+  if (options.confirm !== false) {
+    const confirmed = await confirmAction("上传到云端", "会用当前本机数据覆盖云端备份，确定继续吗？", "上传");
+    if (!confirmed) {
+      return;
+    }
   }
 
   try {
@@ -992,32 +1112,42 @@ async function pushCloudData() {
       auth: true,
       data: { data: getCurrentUserData() },
     });
-    uni.showToast({ title: "已上传云端", icon: "success" });
+    markCloudSynced();
+    if (!options.silent) {
+      uni.showToast({ title: "已上传云端", icon: "success" });
+    }
   } catch (error) {
-    uni.showToast({ title: getErrorMessage(error), icon: "none" });
+    if (!options.silent) {
+      uni.showToast({ title: getErrorMessage(error), icon: "none" });
+    }
   } finally {
     isSyncingCloud.value = false;
   }
 }
 
-async function pullCloudData() {
-  if (!ensureCloudReady()) {
+async function pullCloudData(options: { silent?: boolean; confirm?: boolean } = {}) {
+  if (!ensureCloudReady(Boolean(options.silent))) {
     return;
   }
 
-  const confirmed = await confirmAction("从云端恢复", "会用云端备份覆盖当前本机数据，确定继续吗？", "恢复");
-  if (!confirmed) {
-    return;
+  if (options.confirm !== false) {
+    const confirmed = await confirmAction("从云端恢复", "会用云端备份覆盖当前本机数据，确定继续吗？", "恢复");
+    if (!confirmed) {
+      return;
+    }
   }
 
   try {
     isSyncingCloud.value = true;
     const result = await requestCloud<CloudSyncResponse>("/sync", { auth: true });
     if (!result.data) {
-      uni.showToast({ title: "云端还没有备份", icon: "none" });
+      if (!options.silent) {
+        uni.showToast({ title: "云端还没有备份", icon: "none" });
+      }
       return;
     }
 
+    isHydratingUserData.value = true;
     accounts.value = result.data.accounts || [];
     subscriptionReminders.value = result.data.subscriptionReminders || [];
     defaultHidePasswords.value = result.data.defaultHidePasswords ?? true;
@@ -1025,10 +1155,21 @@ async function pullCloudData() {
     visiblePasswordIds.value = new Set();
     hiddenPasswordIds.value = new Set();
     persistCurrentUserData();
-    uni.showToast({ title: "已从云端恢复", icon: "success" });
+    if (currentUser.value) {
+      uni.setStorageSync(getUserDataStorageKey(currentUser.value.username), getCurrentUserData());
+    }
+    markCloudSynced();
+    if (!options.silent) {
+      uni.showToast({ title: "已从云端恢复", icon: "success" });
+    }
   } catch (error) {
-    uni.showToast({ title: getErrorMessage(error), icon: "none" });
+    if (!options.silent) {
+      uni.showToast({ title: getErrorMessage(error), icon: "none" });
+    }
   } finally {
+    setTimeout(() => {
+      isHydratingUserData.value = false;
+    }, 0);
     isSyncingCloud.value = false;
   }
 }
@@ -1102,12 +1243,12 @@ function importSimpleAccounts(rawText: string) {
       short: name.slice(0, 2).toUpperCase(),
       login,
       password,
-      category: "个人",
-      renewal: "无",
+      category: CATEGORY_PERSONAL,
+      renewal: NO_RENEWAL,
       risk: "medium",
       issue: "文本导入",
       color: "#F3C84B",
-      tags: ["个人"],
+      tags: [CATEGORY_PERSONAL],
     });
   }
 
@@ -1144,6 +1285,8 @@ function saveAccount() {
     return;
   }
 
+  const category = normalizeCategory(draft.category);
+
   if (editingId.value) {
     const target = accounts.value.find((item) => item.id === editingId.value);
     if (target) {
@@ -1151,9 +1294,9 @@ function saveAccount() {
       target.short = draft.name.trim().slice(0, 2).toUpperCase();
       target.login = draft.login.trim() || "未填写";
       target.password = draft.password;
-      target.category = draft.category.trim() || "未分类";
+      target.category = category;
       target.tags = [target.category];
-      target.color = target.category === "云服务" ? "#214A87" : target.color;
+      target.color = getCategoryColor(category, target.color);
     }
     uni.showToast({ title: "已保存", icon: "success" });
     closeForm();
@@ -1166,12 +1309,12 @@ function saveAccount() {
     short: draft.name.trim().slice(0, 2).toUpperCase(),
     login: draft.login.trim() || "未填写",
     password: draft.password,
-    category: draft.category.trim() || "未分类",
-    renewal: "无",
+    category,
+    renewal: NO_RENEWAL,
     risk: "medium",
     issue: "手动添加",
-    color: draft.category.trim() === "云服务" ? "#214A87" : "#F3C84B",
-    tags: [draft.category.trim() || "未分类"],
+    color: getCategoryColor(category),
+    tags: [category],
   });
 
   uni.showToast({ title: "已添加", icon: "success" });
@@ -1684,6 +1827,48 @@ function saveAccount() {
 .subscription-option.active {
   background: #214a87;
   color: #fffdf7;
+}
+
+.category-picker {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12rpx;
+  margin-top: 14rpx;
+}
+
+.category-chip {
+  min-width: 0;
+  padding: 16rpx 12rpx;
+  border: 1rpx solid rgba(33, 74, 135, 0.08);
+  border-radius: 20rpx;
+  background: #f5f0e6;
+  color: #6e6a63;
+  text-align: center;
+}
+
+.category-chip.active {
+  background: #214a87;
+  color: #fffdf7;
+  box-shadow: 0 10rpx 20rpx rgba(33, 74, 135, 0.18);
+}
+
+.category-chip-title,
+.category-chip-hint {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.category-chip-title {
+  font-size: 25rpx;
+  font-weight: 900;
+}
+
+.category-chip-hint {
+  margin-top: 5rpx;
+  font-size: 19rpx;
+  opacity: 0.72;
 }
 
 .field {
