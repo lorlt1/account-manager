@@ -294,14 +294,14 @@
             v-for="category in categoryOptions"
             :key="category.value"
             class="category-chip"
-            :class="{ active: draft.category === category.value }"
-            @tap="selectCategory(category.value)"
+            :class="{ active: draft.kind === category.value }"
+            @tap="selectCategoryKind(category.value)"
           >
             <text class="category-chip-title">{{ category.label }}</text>
             <text class="category-chip-hint">{{ category.hint }}</text>
           </view>
         </view>
-        <input v-model="draft.category" class="field" placeholder="自定义分类，例如 开发 / 社交 / 邮箱" />
+        <input v-model="draft.category" class="field" placeholder="标签，例如 社交 / 邮箱 / 游戏" />
         <button class="primary-button" @tap="saveAccount">{{ editingId ? '保存修改' : '保存账号' }}</button>
       </view>
     </view>
@@ -333,6 +333,7 @@ import { computed, onMounted, reactive, ref, watch } from "vue";
 type Risk = "high" | "medium" | "low";
 type TabKey = "home" | "accounts" | "alerts" | "settings";
 type NavKey = TabKey | "create";
+type AccountKind = "personal" | "subscription" | "service";
 
 interface Account {
   id: number;
@@ -341,6 +342,7 @@ interface Account {
   login: string;
   password: string;
   category: string;
+  kind?: AccountKind;
   renewal: string;
   risk: Risk;
   issue: string;
@@ -424,6 +426,7 @@ const draft = reactive({
   name: "",
   login: "",
   password: "",
+  kind: "personal" as AccountKind,
   category: "",
 });
 
@@ -475,9 +478,9 @@ const filters = [
 ];
 
 const categoryOptions = [
-  { label: "个人", value: CATEGORY_PERSONAL, hint: "普通账号" },
-  { label: "订阅", value: CATEGORY_SUBSCRIPTION, hint: "续费提醒" },
-  { label: "服务", value: CATEGORY_SERVICE, hint: "云服务/域名" },
+  { label: "个人", value: "personal" as const, hint: "普通账号" },
+  { label: "订阅", value: "subscription" as const, hint: "续费提醒" },
+  { label: "服务", value: "service" as const, hint: "云服务/域名" },
 ];
 
 const accounts = ref<Account[]>([
@@ -798,20 +801,42 @@ function isNoRenewal(value: string) {
 }
 
 function isServiceAccount(account: Account) {
-  return account.category === CATEGORY_SERVICE || account.category === CATEGORY_CLOUD_SERVICE;
+  return getAccountKind(account) === "service";
 }
 
 function isSubscriptionAccount(account: Account) {
-  return account.category === CATEGORY_SUBSCRIPTION;
+  return getAccountKind(account) === "subscription";
 }
 
 function isPersonalAccount(account: Account) {
-  return !isSubscriptionAccount(account) && !isServiceAccount(account);
+  return getAccountKind(account) === "personal";
 }
 
-function normalizeCategory(category: string) {
+function getAccountKind(account: Account): AccountKind {
+  if (account.kind) {
+    return account.kind;
+  }
+
+  if (account.category === CATEGORY_SUBSCRIPTION) {
+    return "subscription";
+  }
+
+  if (account.category === CATEGORY_SERVICE || account.category === CATEGORY_CLOUD_SERVICE) {
+    return "service";
+  }
+
+  return "personal";
+}
+
+function normalizeCategory(category: string, kind: AccountKind) {
   const value = category.trim();
   if (!value) {
+    if (kind === "subscription") {
+      return CATEGORY_SUBSCRIPTION;
+    }
+    if (kind === "service") {
+      return CATEGORY_SERVICE;
+    }
     return CATEGORY_PERSONAL;
   }
 
@@ -822,20 +847,20 @@ function normalizeCategory(category: string) {
   return value;
 }
 
-function getCategoryColor(category: string, currentColor?: string) {
-  if (category === CATEGORY_SERVICE) {
+function getCategoryColor(kind: AccountKind, currentColor?: string) {
+  if (kind === "service") {
     return "#214A87";
   }
 
-  if (category === CATEGORY_SUBSCRIPTION) {
+  if (kind === "subscription") {
     return "#8FCB9B";
   }
 
   return currentColor || "#F3C84B";
 }
 
-function selectCategory(category: string) {
-  draft.category = category;
+function selectCategoryKind(kind: AccountKind) {
+  draft.kind = kind;
 }
 
 function markCloudSynced() {
@@ -881,6 +906,7 @@ function resetDraft() {
   draft.name = "";
   draft.login = "";
   draft.password = "";
+  draft.kind = "personal";
   draft.category = "";
 }
 
@@ -957,6 +983,7 @@ function editAccount(account: Account) {
   draft.name = account.name;
   draft.login = account.login;
   draft.password = account.password;
+  draft.kind = getAccountKind(account);
   draft.category = account.category;
   showForm.value = true;
 }
@@ -1243,6 +1270,7 @@ function importSimpleAccounts(rawText: string) {
       short: name.slice(0, 2).toUpperCase(),
       login,
       password,
+      kind: "personal",
       category: CATEGORY_PERSONAL,
       renewal: NO_RENEWAL,
       risk: "medium",
@@ -1285,7 +1313,8 @@ function saveAccount() {
     return;
   }
 
-  const category = normalizeCategory(draft.category);
+  const kind = draft.kind;
+  const category = normalizeCategory(draft.category, kind);
 
   if (editingId.value) {
     const target = accounts.value.find((item) => item.id === editingId.value);
@@ -1294,9 +1323,10 @@ function saveAccount() {
       target.short = draft.name.trim().slice(0, 2).toUpperCase();
       target.login = draft.login.trim() || "未填写";
       target.password = draft.password;
+      target.kind = kind;
       target.category = category;
       target.tags = [target.category];
-      target.color = getCategoryColor(category, target.color);
+      target.color = getCategoryColor(kind, target.color);
     }
     uni.showToast({ title: "已保存", icon: "success" });
     closeForm();
@@ -1309,11 +1339,12 @@ function saveAccount() {
     short: draft.name.trim().slice(0, 2).toUpperCase(),
     login: draft.login.trim() || "未填写",
     password: draft.password,
+    kind,
     category,
     renewal: NO_RENEWAL,
     risk: "medium",
     issue: "手动添加",
-    color: getCategoryColor(category),
+    color: getCategoryColor(kind),
     tags: [category],
   });
 
